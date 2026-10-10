@@ -52,12 +52,13 @@ trap 'die "interrupted"' INT TERM
 
 usage() {
   cat <<'EOF'
-usage: xlup [-c] [-a] [-A] [-x] [-y] [-h]
+usage: xlup [-c] [-a] [-A] [-d] [-x] [-y] [-h]
 
   xlup        install or update XLibre from source
   xlup -c     check for updates (exit 10 if any)
   xlup -a     enable weekly auto-update
   xlup -A     disable auto-update
+  xlup -d     show how to make XLibre the default X server
   xlup -x     uninstall everything xlup installed
   xlup -y     assume yes (non-interactive)
   xlup -h     this help
@@ -65,16 +66,17 @@ usage: xlup [-c] [-a] [-A] [-x] [-y] [-h]
 Builds XLibre (xserver + drivers from github.com/X11Libre) with meson/ninja,
 installs into /usr/local (the system Xorg is not touched), records manifests in
 /var/lib/xlup, and keeps the last 3 backups of /etc/X11 and /usr/bin/Xorg in
-/var/lib/xlup/backups. After install it prints how to make XLibre the default.
+/var/lib/xlup/backups. At the end it offers to configure ~/.xserverrc.
 EOF
 }
 
 MODE=install; EXPL=0; AUTO=0; ASSUME_YES=0
-while getopts ':caxAhy' o; do
+while getopts ':caxAdhy' o; do
   case $o in
     c) MODE=check; EXPL=1 ;;
     x) MODE=remove; EXPL=1 ;;
     A) MODE=autooff; EXPL=1 ;;
+    d) MODE=hint; EXPL=1 ;;
     a) AUTO=1 ;;
     y) ASSUME_YES=1 ;;
     h) usage; exit 0 ;;
@@ -83,11 +85,14 @@ while getopts ':caxAhy' o; do
 done
 
 SUDO=""
-if [[ $EUID -ne 0 && $MODE != check ]]; then
-  command -v sudo >/dev/null || die "run as root"
-  [[ -f $0 ]] || die "run xlup from a file"
-  exec sudo -- bash "$0" "$@"
+if [[ $EUID -ne 0 ]]; then
+  command -v sudo >/dev/null || die "run as root or install sudo"
+  SUDO="sudo"
 fi
+
+TARGET_USER="${SUDO_USER:-${USER:-root}}"
+TARGET_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)
+[[ -n $TARGET_HOME && -d $TARGET_HOME ]] || TARGET_HOME=""
 
 S_PREFIX='' S_PINNED='' S_DRIVERS='' S_BUILDTYPE='' S_SERVER_REF='' S_SERVER_SHA='' S_XP=0 S_XP_REF='' S_XP_SHA=''
 HAVE=0
@@ -98,6 +103,9 @@ PINNED=$S_PINNED
 DRIVERS=${S_DRIVERS:-xf86-input-libinput}
 BUILDTYPE=${S_BUILDTYPE:-release}
 JOBS=$(nproc 2>/dev/null || echo 2)
+MEM=$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 2)
+[[ $MEM -ge 1 ]] || MEM=1
+[[ $JOBS -le $MEM ]] || JOBS=$MEM
 WORK=$CACHE
 SRC=$WORK/src
 
@@ -175,13 +183,23 @@ changes() {
   return 0
 }
 
+detect_init() {
+  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    echo systemd
+  elif [[ -d /run/openrc ]] || command -v rc-status >/dev/null 2>&1 || [[ -x /sbin/openrc ]]; then
+    echo openrc
+  else
+    echo other
+  fi
+}
+
 auto_off() {
-  if [[ -f /etc/systemd/system/xlup.timer ]]; then
+  if [[ -f /etc/systemd/system/xlup.timer ]] && command -v systemctl >/dev/null 2>&1; then
     $SUDO systemctl disable --now xlup.timer 2>/dev/null || true
     $SUDO rm -f /etc/systemd/system/xlup.timer /etc/systemd/system/xlup.service
     $SUDO systemctl daemon-reload 2>/dev/null || true
   fi
-  $SUDO rm -f /etc/cron.d/xlup
+  $SUDO rm -f /etc/periodic/weekly/xlup /etc/cron.weekly/xlup /etc/cron.d/xlup
 }
 
 install_self() {
@@ -205,12 +223,9 @@ install_self() {
   return 0
 }
 
-auto_on() {
-  install_self || die "auto-update requires the script to be run from a file"
-  [[ -x $SELF ]] || die "$SELF not found after install"
-  local cmd="$SELF -y"
-  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
-    $SUDO tee /etc/systemd/system/xlup.service >/dev/null <<EOF
+auto_on_systemd() {
+  local cmd=$1
+  $SUDO tee /etc/systemd/system/xlup.service >/dev/null <<EOF
 [Unit]
 Description=XLibre update
 Wants=network-online.target
@@ -221,7 +236,7 @@ Type=oneshot
 Nice=10
 ExecStart=$cmd
 EOF
-    $SUDO tee /etc/systemd/system/xlup.timer >/dev/null <<'EOF'
+  $SUDO tee /etc/systemd/system/xlup.timer >/dev/null <<'EOF'
 [Unit]
 Description=Weekly XLibre update
 
@@ -233,15 +248,104 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    $SUDO systemctl daemon-reload
-    $SUDO systemctl enable --now xlup.timer
-  elif [[ -d /etc/cron.d ]]; then
-    echo "17 4 * * 0 root $cmd >> /var/log/xlup.log 2>&1" | $SUDO tee /etc/cron.d/xlup >/dev/null
-    $SUDO chmod 644 /etc/cron.d/xlup
-  else
-    die "neither systemd nor /etc/cron.d found (install cron)"
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now xlup.timer
+}
+
+auto_on_openrc() {
+  local cmd=$1
+  local body
+  body=$(cat <<EOF
+#!/bin/sh
+exec $cmd >>/var/log/xlup.log 2>&1
+EOF
+)
+
+  local installed=0
+
+  if [[ -d /etc/periodic/weekly ]]; then
+    printf '%s\n' "$body" | $SUDO tee /etc/periodic/weekly/xlup >/dev/null
+    $SUDO chmod +x /etc/periodic/weekly/xlup
+    log "openrc: installed /etc/periodic/weekly/xlup"
+    installed=1
   fi
-  log "weekly auto-update enabled"
+
+  if [[ -d /etc/cron.weekly ]]; then
+    printf '%s\n' "$body" | $SUDO tee /etc/cron.weekly/xlup >/dev/null
+    $SUDO chmod +x /etc/cron.weekly/xlup
+    log "openrc: installed /etc/cron.weekly/xlup"
+    installed=1
+  fi
+
+  if [[ $installed -eq 0 ]]; then
+    if command -v crond >/dev/null 2>&1 \
+       || command -v cron  >/dev/null 2>&1 \
+       || [[ -d /etc/cron.d ]]; then
+      $SUDO install -d /etc/cron.weekly
+      printf '%s\n' "$body" | $SUDO tee /etc/cron.weekly/xlup >/dev/null
+      $SUDO chmod +x /etc/cron.weekly/xlup
+      log "openrc: created /etc/cron.weekly/xlup"
+      installed=1
+    fi
+  fi
+
+  if [[ $installed -eq 0 ]]; then
+    warn "openrc detected but no cron/periodic directory found"
+    warn "install a cron daemon (busybox crond / cronie) and re-run 'xlup -a'"
+    return 1
+  fi
+
+  if command -v rc-service >/dev/null 2>&1; then
+    if ! rc-service crond status >/dev/null 2>&1 \
+       && ! rc-service cron  status >/dev/null 2>&1; then
+      warn "cron service not running; enable it:"
+      warn "  rc-update add crond default   # busybox"
+      warn "  rc-update add cron  default   # cronie"
+    fi
+  fi
+  return 0
+}
+
+auto_on_manual() {
+  local cmd=$1
+  warn "unrecognized init system; automatic setup not possible"
+  {
+    echo
+    echo "To enable weekly auto-update manually, add a job that runs:"
+    echo "    $cmd"
+    echo
+    echo "Examples:"
+    echo "  cron:   echo '0 4 * * 0 root $cmd >> /var/log/xlup.log 2>&1' | sudo tee /etc/cron.d/xlup"
+    echo "  runit:  mkdir -p /etc/sv/xlup && printf '#!/bin/sh\\nexec $cmd\\n' > /etc/sv/xlup/run"
+    echo "          chmod +x /etc/sv/xlup/run && ln -s /etc/sv/xlup /var/service/"
+    echo "  s6:     create /etc/s6/service/xlup/run and register with s6-rc"
+    echo "  dinit:  create /etc/dinit.d/xlup and add to boot"
+    echo "  custom: use whatever scheduler your init provides"
+    echo
+    echo "Or just run 'xlup' manually whenever you want to update."
+  } >&2
+  return 0
+}
+
+auto_on() {
+  install_self || die "auto-update requires the script to be run from a file"
+  [[ -x $SELF ]] || die "$SELF not found after install"
+  local cmd="$SELF -y"
+  local init
+  init=$(detect_init)
+  case $init in
+    systemd)
+      auto_on_systemd "$cmd" || die "systemd setup failed"
+      log "weekly auto-update enabled (systemd timer)"
+      ;;
+    openrc)
+      auto_on_openrc "$cmd" || die "openrc auto-update setup failed"
+      log "weekly auto-update enabled (openrc)"
+      ;;
+    *)
+      auto_on_manual "$cmd"
+      ;;
+  esac
 }
 
 record() {
@@ -255,37 +359,63 @@ divert_off() {
   fi
 }
 
+is_default() {
+  local x=$PREFIX/bin/Xorg
+  [[ -n $TARGET_HOME ]] || return 1
+  grep -qs -- "$x" "$TARGET_HOME/.xserverrc" && return 0
+  return 1
+}
+
+note() {
+  if ! is_default; then log "note: XLibre is not the default X server yet; run 'xlup -d' to see how"; fi
+}
+
+set_default() {
+  local x=$PREFIX/bin/Xorg
+  [[ -x $x ]] || return 0
+  [[ -n $TARGET_HOME ]] || { warn "cannot determine home directory for user $TARGET_USER"; return 1; }
+
+  local rc="$TARGET_HOME/.xserverrc"
+
+  if [[ -f $rc ]] && grep -qs -- "$x" "$rc"; then
+    log "already configured: $rc"
+    return 0
+  fi
+
+  if [[ $ASSUME_YES -eq 0 ]]; then
+    [[ -t 0 ]] || { warn "no tty; skipping ~/.xserverrc"; return 1; }
+    local ans
+    if [[ -e $rc ]]; then
+      read -r -p "xlup: $rc exists, overwrite with XLibre config? [y/N] " ans
+    else
+      read -r -p "xlup: create ~/.xserverrc so startx uses XLibre? [y/N] " ans
+    fi
+    [[ $ans =~ ^[Yy] ]] || { log "keeping existing configuration"; return 1; }
+  fi
+
+  printf '#!/bin/sh\nexec %s -nolisten tcp "$@"\n' "$x" \
+    | $SUDO tee "$rc" >/dev/null
+  $SUDO chmod +x "$rc"
+  log "startx: $rc configured to use $x"
+}
+
 hint() {
-  local x=$PREFIX/bin/Xorg dm
-  dm=$(basename -- "$(cat /etc/X11/default-display-manager 2>/dev/null || true)")
-  log "XLibre is installed but is not the default X server yet. Test it first:"
-  echo "  sudo $x :1 vt8"
-  log "To make it the default (${dm:-no display manager found}), run:"
-  case $dm in
-    lightdm)
-      echo "  sudo install -d /etc/lightdm/lightdm.conf.d"
-      echo "  printf '[Seat:*]\nxserver-command=$x\n' | sudo tee /etc/lightdm/lightdm.conf.d/50-xlibre.conf"
-      log "Undo: sudo rm /etc/lightdm/lightdm.conf.d/50-xlibre.conf" ;;
-    sddm)
-      echo "  sudo install -d /etc/sddm.conf.d"
-      echo "  printf '[X11]\nServerPath=$x\n' | sudo tee /etc/sddm.conf.d/50-xlibre.conf"
-      log "Undo: sudo rm /etc/sddm.conf.d/50-xlibre.conf" ;;
-    '')
-      echo "  printf '#!/bin/sh\nexec $x -nolisten tcp \"\$@\"\n' > ~/.xserverrc && chmod +x ~/.xserverrc"
-      log "Undo: rm ~/.xserverrc" ;;
-    *)
-      echo "  sudo dpkg-divert --package xlup --divert /usr/bin/Xorg.xorg --rename --add /usr/bin/Xorg"
-      echo "  sudo ln -sf $x /usr/bin/Xorg"
-      log "Undo: sudo rm /usr/bin/Xorg && sudo dpkg-divert --package xlup --remove --rename /usr/bin/Xorg" ;;
-  esac
-  log "'sudo xlup -x' also undoes the divert and removes XLibre"
+  local x=$PREFIX/bin/Xorg
+  log "test XLibre first: sudo $x :1 vt8"
+  log "startx (as the user who starts X, not with sudo):"
+  echo "  printf '#!/bin/sh\nexec $x -nolisten tcp \"\$@\"\n' > ~/.xserverrc && chmod +x ~/.xserverrc"
+  log "verify: pgrep -a Xorg  (must show $x, not /usr/lib/xorg/Xorg)"
 }
 
 case $MODE in
   remove)
     [[ -d $MANI ]] || die "nothing to remove"
     divert_off
-    $SUDO rm -f /etc/apt/apt.conf.d/99xlup
+    $SUDO rm -f /etc/apt/apt.conf.d/99xlup /etc/lightdm/lightdm.conf.d/50-xlibre.conf /etc/sddm.conf.d/50-xlibre.conf
+    if [[ -n $TARGET_HOME && -f $TARGET_HOME/.xserverrc ]] \
+       && grep -qs -- "$S_PREFIX/bin/Xorg" "$TARGET_HOME/.xserverrc"; then
+      drop <<<"$TARGET_HOME/.xserverrc"
+    fi
     drop < <({ cat "$MANI"/*.list 2>/dev/null || true; } | sort -ur)
     if [[ -n $S_PREFIX && $S_PREFIX != /usr && $S_PREFIX != /usr/local ]]; then
       $SUDO find "$S_PREFIX" -depth -type d -empty -delete
@@ -296,12 +426,16 @@ case $MODE in
     $SUDO ldconfig || true
     log "removed"
     exit 0 ;;
+  hint)
+    [[ $HAVE -eq 1 ]] || die "not installed"
+    hint; exit 0 ;;
   autooff)
     auto_off; log "auto-update disabled"; exit 0 ;;
   check)
     [[ $HAVE -eq 1 ]] || die "not installed"
     changes
     log "installed: $S_SERVER_REF in $S_PREFIX"
+    note
     if [[ ${#CHANGES[@]} -eq 0 ]]; then log "up to date"; exit 0; fi
     printf '  %s\n' "${CHANGES[@]}"
     exit 10 ;;
@@ -313,6 +447,8 @@ case $MODE in
       changes
       if [[ ${#CHANGES[@]} -eq 0 ]]; then
         log "up to date ($S_SERVER_REF)"
+        set_default || true
+        note
         exit 0
       fi
       printf '  %s\n' "${CHANGES[@]}"
@@ -341,6 +477,8 @@ if [[ $ASSUME_YES -eq 0 ]]; then
 fi
 
 mkdir -p "$WORK"
+AVAIL=$(df -Pk "$WORK" | awk 'NR==2{print $4}')
+[[ $AVAIL -ge 1048576 ]] || die "less than 1 GB free in $WORK"
 if command -v flock >/dev/null; then
   exec 9>"$WORK/.lock"
   flock -n 9 || die "another build is running"
@@ -363,7 +501,7 @@ OPT=(
   libxcb-keysyms1-dev libxcb-image0-dev libxcb-render-util0-dev libxcb-randr0-dev
   libxcb-xkb-dev libxcb-xv0-dev libxcb-glx0-dev libxcb-xf86dri0-dev libxcb-render0-dev
   libxcb-composite0-dev libxcb-xinput-dev libxcb-ewmh-dev libxcb-present-dev
-  libxcb-dri2-0-dev libxcb-dri3-dev libxcb-res0-dev libxcb-shm0-dev libxcb-sync-dev
+  libxcb-dri2-0-dev libxcb-dri3-0-dev libxcb-res0-dev libxcb-shm0-dev libxcb-sync-dev
   libxcb-xfixes0-dev libxcb-xinerama0-dev libx11-xcb-dev
   libxmu-dev libxrender-dev libxi-dev libxres-dev libxtst-dev libxrandr-dev
   libxfixes-dev libxv-dev libxvmc-dev libxinerama-dev libxcursor-dev libxdamage-dev
@@ -372,7 +510,7 @@ OPT=(
 )
 
 log "installing build dependencies"
-$SUDO apt-get update || warn "apt-get update failed; using existing indexes"
+$SUDO apt-get -o DPkg::Lock::Timeout=300 update || warn "apt-get update failed; using existing indexes"
 AV=(); MISS=()
 for p in "${REQ[@]}"; do
   if apt-cache show "$p" >/dev/null 2>&1; then AV+=("$p"); else MISS+=("$p"); fi
@@ -381,7 +519,7 @@ done
 for p in "${OPT[@]}"; do
   if apt-cache show "$p" >/dev/null 2>&1; then AV+=("$p"); fi
 done
-DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends "${AV[@]}"
+DEBIAN_FRONTEND=noninteractive $SUDO apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends "${AV[@]}"
 
 command -v meson >/dev/null || die "meson not found"
 MV=$(meson --version)
@@ -580,7 +718,10 @@ if [[ $AUTO -eq 1 ]]; then auto_on; fi
 
 log "installed XLibre $SREF in $PREFIX"
 log "backups: $ST/backups (last 3 kept)"
-if [[ $IS_UPDATE -eq 0 || -t 1 ]]; then hint; fi
+
+set_default || true
+
+if [[ $IS_UPDATE -eq 0 || -t 1 ]]; then is_default || hint; fi
 
 [[ ${#FAILED[@]} -gt 0 ]] && warn "failed drivers: ${FAILED[*]}"
 [[ $IS_UPDATE -eq 1 ]] && warn "restart the X session to use the new version"
